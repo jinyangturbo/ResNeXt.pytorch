@@ -16,7 +16,18 @@ __email__ = "pau.rodri1@gmail.com"
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import init
+from torch.autograd import Variable
 
+def drop01avg(ratio, D):
+    mask = Variable(torch.bernoulli(ratio.data) - ratio.data) + ratio
+    siz = mask.size(0)
+    wid = torch.matmul(mask.view(siz,1),Variable(torch.ones(1,D//siz))).view(D)
+    return wid
+
+def groupatt(score, D):
+    siz = score.size(0)
+    wid = torch.matmul(score.view(siz,1),Variable(torch.ones(1,D//siz))).view(D)
+    return wid
 
 class ResNeXtBottleneck(nn.Module):
     """
@@ -62,6 +73,112 @@ class ResNeXtBottleneck(nn.Module):
         return F.relu(residual + bottleneck, inplace=True)
 
 
+class SENeXtBottleneck(nn.Module):
+    """
+    RexNeXt bottleneck type C (https://github.com/facebookresearch/ResNeXt/blob/master/models/resnext.lua)
+    """
+
+    def __init__(self, in_channels, out_channels, stride, cardinality, base_width, widen_factor):
+        """ Constructor
+
+        Args:
+            in_channels: input channel dimensionality
+            out_channels: output channel dimensionality
+            stride: conv stride. Replaces pooling layer.
+            cardinality: num of convolution groups.
+            base_width: base number of channels in each group.
+            widen_factor: factor to reduce the input dimensionality before convolution.
+        """
+        super(ResNeXtBottleneck, self).__init__()
+        width_ratio = out_channels / (widen_factor * 64.)
+        D = cardinality * int(base_width * width_ratio)
+        self.conv_reduce = nn.Conv2d(in_channels, D, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn_reduce = nn.BatchNorm2d(D)
+        self.conv_conv = nn.Conv2d(D, D, kernel_size=3, stride=stride, padding=1, groups=cardinality, bias=False)
+        self.bn = nn.BatchNorm2d(D)
+        self.conv_expand = nn.Conv2d(D, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn_expand = nn.BatchNorm2d(out_channels)
+        # Select layers
+        self.fc1 = nn.Conv2d(out_channels, out_channels//16, kernel_size=1)  # Use nn.Conv2d instead of nn.Linear
+        self.fc2 = nn.Conv2d(out_channels//16, out_channels, kernel_size=1)
+
+        self.shortcut = nn.Sequential()
+        if in_channels != out_channels:
+            self.shortcut.add_module('shortcut_conv',
+                                     nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, padding=0,
+                                               bias=False))
+            self.shortcut.add_module('shortcut_bn', nn.BatchNorm2d(out_channels))
+
+    def forward(self, x):
+        bottleneck = self.conv_reduce.forward(x)
+        bottleneck = F.relu(self.bn_reduce.forward(bottleneck), inplace=True)       
+        bottleneck = self.conv_conv.forward(bottleneck)
+        bottleneck = F.relu(self.bn.forward(bottleneck), inplace=True)     
+        bottleneck = self.conv_expand.forward(bottleneck)
+        bottleneck = self.bn_expand.forward(bottleneck)
+        # Squeeze
+        w = F.avg_pool2d(bottleneck, (bottleneck.size(2),bottleneck.size(3)))
+        w = F.relu(self.fc1(w))
+        w = F.sigmoid(self.fc2(w))
+        # Expand
+        bottleneck = bottleneck * w
+        residual = self.shortcut.forward(x)
+        return F.relu(residual + bottleneck, inplace=True)  
+    
+class SelNeXtBottleneck(nn.Module):
+    """
+    RexNeXt bottleneck type C (https://github.com/facebookresearch/ResNeXt/blob/master/models/resnext.lua)
+    """
+
+    def __init__(self, in_channels, out_channels, stride, cardinality, base_width, widen_factor):
+        """ Constructor
+
+        Args:
+            in_channels: input channel dimensionality
+            out_channels: output channel dimensionality
+            stride: conv stride. Replaces pooling layer.
+            cardinality: num of convolution groups.
+            base_width: base number of channels in each group.
+            widen_factor: factor to reduce the input dimensionality before convolution.
+        """
+        super(ResNeXtBottleneck, self).__init__()
+        width_ratio = out_channels / (widen_factor * 64.)
+        D = cardinality * int(base_width * width_ratio)
+        self.conv_reduce = nn.Conv2d(in_channels, D, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn_reduce = nn.BatchNorm2d(D)
+        self.conv_conv = nn.Conv2d(D, D, kernel_size=3, stride=stride, padding=1, groups=cardinality, bias=False)
+        self.bn = nn.BatchNorm2d(D)
+        self.conv_expand = nn.Conv2d(D, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn_expand = nn.BatchNorm2d(out_channels)
+        # Select layers
+        self.fc1 = nn.Conv2d(D, D//16, kernel_size=1)  # Use nn.Conv2d instead of nn.Linear
+        self.fc2 = nn.Conv2d(D//16, cardinality, kernel_size=1)
+
+        self.shortcut = nn.Sequential()
+        if in_channels != out_channels:
+            self.shortcut.add_module('shortcut_conv',
+                                     nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, padding=0,
+                                               bias=False))
+            self.shortcut.add_module('shortcut_bn', nn.BatchNorm2d(out_channels))
+  
+    def forward(self, x):
+        bottleneck = self.conv_reduce.forward(x)
+        bottleneck = F.relu(self.bn_reduce.forward(bottleneck), inplace=True)
+        # Select groups
+        w = F.avg_pool2d(bottleneck, (bottleneck.size(2),bottleneck.size(3)))
+        w = F.relu(self.fc1(w))
+        w = F.sigmoid(self.fc2(w))
+        mask = drop01avg(w,D)
+        # compute groups
+        bottleneck = self.conv_conv.forward(bottleneck)
+        bottleneck = F.relu(self.bn.forward(bottleneck), inplace=True)
+        # drop groups
+        bottleneck = bottleneck * mask
+        bottleneck = self.conv_expand.forward(bottleneck)
+        bottleneck = self.bn_expand.forward(bottleneck)
+        residual = self.shortcut.forward(x)
+        return F.relu(residual + bottleneck, inplace=True) 
+    
 class CifarResNeXt(nn.Module):
     """
     ResNext optimized for the Cifar dataset, as specified in
