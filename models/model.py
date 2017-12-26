@@ -108,9 +108,9 @@ class SENeXtBottleneck(nn.Module):
         self.conv_expand = nn.Conv2d(D, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn_expand = nn.BatchNorm2d(out_channels)
         # Select layers
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc1 = nn.Conv2d(out_channels, out_channels//16, kernel_size=1)  # Use nn.Conv2d instead of nn.Linear
         self.fc2 = nn.Conv2d(out_channels//16, out_channels, kernel_size=1)
-
         self.shortcut = nn.Sequential()
         if in_channels != out_channels:
             self.shortcut.add_module('shortcut_conv',
@@ -124,7 +124,7 @@ class SENeXtBottleneck(nn.Module):
         bottleneck = self.conv_conv.forward(bottleneck)
         bottleneck = F.relu(self.bn.forward(bottleneck), inplace=True)
         # Squeeze
-        w = F.avg_pool2d(bottleneck, bottleneck.size(2)))
+        w = self.avg_pool(bottleneck)
         w = F.relu(self.fc1(w))
         w = F.sigmoid(self.fc2(w))
         # Expand
@@ -164,7 +164,8 @@ class SelNeXtBottleneck(nn.Module):
         # Select layers
         self.fc1 = nn.Conv2d(D, D//16, kernel_size=1)  # Use nn.Conv2d instead of nn.Linear
         self.fc2 = nn.Conv2d(D//16, cardinality, kernel_size=1)
-
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        
         self.shortcut = nn.Sequential()
         if in_channels != out_channels:
             self.shortcut.add_module('shortcut_conv',
@@ -176,7 +177,7 @@ class SelNeXtBottleneck(nn.Module):
         bottleneck = self.conv_reduce.forward(x)
         bottleneck = F.relu(self.bn_reduce.forward(bottleneck), inplace=True)
         # Select groups
-        w = F.avg_pool2d(bottleneck, (bottleneck.size(2),bottleneck.size(3)))
+        w = self.avg_pool(bottleneck)
         w = F.relu(self.fc1(w))
         w = F.sigmoid(self.fc2(w))
         mask = GroupAttDrop(w,self.cardinality,self.group_width)
