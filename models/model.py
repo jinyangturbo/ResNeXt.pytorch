@@ -18,15 +18,22 @@ import torch.nn.functional as F
 from torch.nn import init
 from torch.autograd import Variable
 
-def drop01avg(ratio, D):
-    mask = Variable(torch.bernoulli(ratio.data) - ratio.data) + ratio
-    siz = mask.size(0)
-    wid = torch.matmul(mask.view(siz,1),Variable(torch.ones(1,D//siz))).view(D)
+def GroupAttDrop(score, cardinality, group_width):
+    assert score.size(0) == cardinality
+    mask = Variable(torch.bernoulli(score.data) - score.data) + ratio
+    wid = torch.matmul(mask.view(cardinality,1),Variable(torch.ones(1,group_width))).view(cardinality*group_width)
     return wid
 
-def groupatt(score, D):
-    siz = score.size(0)
-    wid = torch.matmul(score.view(siz,1),Variable(torch.ones(1,D//siz))).view(D)
+def GroupRandDrop(p = 0.5,  cardinality, group_width):
+    assert p < 1.
+    mask = torch.FloatTensor(1).fill_(1-p).expand(cardinality)
+    mask = torch.bernoulli(mask)
+    wid = torch.matmul(mask.view(cardinality,1),Variable(torch.ones(1,group_width))).view(cardinality*group_width)
+    return wid
+
+def GroupAttAvg(score, cardinality, group_width):
+    assert score.size(0) == cardinality
+    wid = torch.matmul(score.view(cardinality,1),Variable(torch.ones(1,group_width))).view(cardinality*group_width)
     return wid
 
 class ResNeXtBottleneck(nn.Module):
@@ -91,7 +98,9 @@ class SENeXtBottleneck(nn.Module):
         """
         super(ResNeXtBottleneck, self).__init__()
         width_ratio = out_channels / (widen_factor * 64.)
-        D = cardinality * int(base_width * width_ratio)
+        self.cardinality = cardinality
+        self.group_width = int(base_width * width_ratio)
+        D = cardinality * group_width
         self.conv_reduce = nn.Conv2d(in_channels, D, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn_reduce = nn.BatchNorm2d(D)
         self.conv_conv = nn.Conv2d(D, D, kernel_size=3, stride=stride, padding=1, groups=cardinality, bias=False)
@@ -113,15 +122,15 @@ class SENeXtBottleneck(nn.Module):
         bottleneck = self.conv_reduce.forward(x)
         bottleneck = F.relu(self.bn_reduce.forward(bottleneck), inplace=True)       
         bottleneck = self.conv_conv.forward(bottleneck)
-        bottleneck = F.relu(self.bn.forward(bottleneck), inplace=True)     
-        bottleneck = self.conv_expand.forward(bottleneck)
-        bottleneck = self.bn_expand.forward(bottleneck)
+        bottleneck = F.relu(self.bn.forward(bottleneck), inplace=True)
         # Squeeze
-        w = F.avg_pool2d(bottleneck, (bottleneck.size(2),bottleneck.size(3)))
+        w = F.avg_pool2d(bottleneck, bottleneck.size(2)))
         w = F.relu(self.fc1(w))
         w = F.sigmoid(self.fc2(w))
         # Expand
-        bottleneck = bottleneck * w
+        bottleneck = bottleneck * GroupAttAvg(w,self.cardinality,self.group_width)
+        bottleneck = self.conv_expand.forward(bottleneck)
+        bottleneck = self.bn_expand.forward(bottleneck)
         residual = self.shortcut.forward(x)
         return F.relu(residual + bottleneck, inplace=True)  
     
@@ -143,7 +152,9 @@ class SelNeXtBottleneck(nn.Module):
         """
         super(ResNeXtBottleneck, self).__init__()
         width_ratio = out_channels / (widen_factor * 64.)
-        D = cardinality * int(base_width * width_ratio)
+        self.cardinality = cardinality
+        self.group_width = int(base_width * width_ratio)
+        D = cardinality * group_width
         self.conv_reduce = nn.Conv2d(in_channels, D, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn_reduce = nn.BatchNorm2d(D)
         self.conv_conv = nn.Conv2d(D, D, kernel_size=3, stride=stride, padding=1, groups=cardinality, bias=False)
@@ -168,7 +179,7 @@ class SelNeXtBottleneck(nn.Module):
         w = F.avg_pool2d(bottleneck, (bottleneck.size(2),bottleneck.size(3)))
         w = F.relu(self.fc1(w))
         w = F.sigmoid(self.fc2(w))
-        mask = drop01avg(w,D)
+        mask = GroupAttDrop(w,self.cardinality,self.group_width)
         # compute groups
         bottleneck = self.conv_conv.forward(bottleneck)
         bottleneck = F.relu(self.bn.forward(bottleneck), inplace=True)
