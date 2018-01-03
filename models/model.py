@@ -19,32 +19,70 @@ import torch.nn.functional as F
 from torch.nn import init
 from torch.autograd import Variable
 
-def GroupAttDrop(score, cardinality, group_width):
-    assert score.size(1) == cardinality
-    mask = Variable(torch.bernoulli(score.data) - score.data) + score
-    #wid = torch.matmul(mask.view(cardinality,1),Variable(torch.ones(1,group_width))).view(cardinality*group_width)
-    wid = torch.matmul(mask.view(-1, cardinality,1),Variable(torch.ones(mask.size(0),1,group_width)).cuda())
-    wid = wid.view(mask.size(0), cardinality*group_width, 1, 1)
-    return wid
+import torch
+import torch.nn as nn
+from torch.autograd import Variable
 
-def GroupRandDrop(p,  cardinality, group_width):
-    assert p < 1.
-    mask = torch.FloatTensor(1).fill_(1-p).expand(cardinality)
-    mask = torch.bernoulli(mask)
-    wid = torch.matmul(mask.view(cardinality,1),Variable(torch.ones(1,group_width))).view(cardinality*group_width)
-    return wid
+class GroupAttDrop(nn.Module):
+    def __init__(self, in_planes, cardinality, group_width, is_drop = True):
+        super(GroupAttDrop, self).__init__()
+        # Select layers
+        D = cardinality * group_width
+        self.is_drop = is_drop
+        self.cardinality = cardinality
+        self.group_width = group_width
+        self.fc1 = nn.Conv2d(in_planes, D//16, kernel_size=1)  # Use nn.Conv2d instead of nn.Linear
+        self.fc2 = nn.Conv2d(D//16, cardinality, kernel_size=1)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.expand = ExpandConv(cardinality, group_width)
+        #self.mask_tensor = torch.FloatTensor(1).fill_(1-self.p).expand((self.in_planes))
+        
+    def forward(self, x):
+        self.w1 = self.avg_pool(x)
+        self.w2 = F.relu(self.fc1(self.w1))
+        self.w3 = F.sigmoid(self.fc2(self.w2))
+        #if self.is_drop == True:
+        #    w += Variable(torch.bernoulli(w.data) - w.data)
+        #print(w.size())
+        #wait = input("PRESS ENTER TO CONTINUE.")
+        self.wid = self.expand(self.w3)
+        return self.wid
+        #if self.training==False: 
 
-def GroupAttAvg(score, cardinality, group_width):
-    #print(score.size())
-    #print(cardinality)
-    #wait = input("PRESS ENTER TO CONTINUE.")
-    assert score.size(1) == cardinality
-    wid = torch.matmul(score.view(-1, cardinality,1),Variable(torch.ones(score.size(0),1,group_width)).cuda())
-    #print(wid.size())
-    wid = wid.view(score.size(0), cardinality*group_width, 1, 1)
-    #print(wid.size())
-    #print(score.size())
-    return wid
+class GroupRandDrop(nn.Module):
+    def __init__(self, cardinality, group_width, p = 0.5, val = 0.3):
+        super(GroupRandDrop, self).__init__()
+        assert p < 1.
+        self.p = p
+        self.val = val
+        self.cardinality = cardinality
+        self.group_width = group_width
+        self.expand = ExpandConv(cardinality, group_width)
+        self.prob_tensor = torch.FloatTensor(1,cardinality).fill_(1.-self.p).cuda()
+        self.one_tensor = torch.FloatTensor(1,cardinality).fill_(1.).cuda()
+        # print(self.p)
+
+    def forward(self,x):
+        if self.training==False: return x
+        # batch shared dropout mask
+        self.mask = torch.bernoulli(self.prob_tensor)
+        self.mask = self.val * self.mask / (1.- self.p) + (1.-self.val) * self.one_tensor
+        self.wid_mask = self.expand(Variable(self.mask, requires_grad=False))
+        return x * self.wid_mask 
+        
+class ExpandConv(nn.Module):
+    def __init__(self, cardinality, group_width):
+        super(ExpandConv, self).__init__()
+        self.D = cardinality * group_width
+        self.cardinality = cardinality
+        self.group_width = group_width
+        self.one_tensor = Variable(torch.ones(1,1,self.group_width), requires_grad=False).cuda()
+        #self.one_tensor = torch.FloatTensor(1,1,self.group_width).fill_(1.).cuda()
+        
+    def forward(self, x):
+        self.wid = torch.matmul(x.view(-1, self.cardinality,1),self.one_tensor.expand(x.size(0),-1,-1))
+        self.wid = self.wid.view(-1, self.D, 1, 1)
+        return self.wid
 
 class ResNeXtBottleneck(nn.Module):
     """
@@ -89,6 +127,52 @@ class ResNeXtBottleneck(nn.Module):
         residual = self.shortcut.forward(x)
         return F.relu(residual + bottleneck, inplace=True)
 
+    
+class DropNeXtBottleneck(nn.Module):
+    """
+    RexNeXt bottleneck type C (https://github.com/facebookresearch/ResNeXt/blob/master/models/resnext.lua)
+    """
+
+    def __init__(self, in_channels, out_channels, stride, cardinality, base_width, widen_factor):
+        """ Constructor
+
+        Args:
+            in_channels: input channel dimensionality
+            out_channels: output channel dimensionality
+            stride: conv stride. Replaces pooling layer.
+            cardinality: num of convolution groups.
+            base_width: base number of channels in each group.
+            widen_factor: factor to reduce the input dimensionality before convolution.
+        """
+        super(DropNeXtBottleneck, self).__init__()
+        width_ratio = out_channels / (widen_factor * 64.)
+        self.group_width = int(base_width * width_ratio)
+        D = cardinality * self.group_width 
+        self.conv_reduce = nn.Conv2d(in_channels, D, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn_reduce = nn.BatchNorm2d(D)
+        self.conv_conv = nn.Conv2d(D, D, kernel_size=3, stride=stride, padding=1, groups=cardinality, bias=False)
+        self.bn = nn.BatchNorm2d(D)
+        self.conv_expand = nn.Conv2d(D, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn_expand = nn.BatchNorm2d(out_channels)
+        self.groupdrop = GroupRandDrop(cardinality,self.group_width)
+
+        self.shortcut = nn.Sequential()
+        if in_channels != out_channels:
+            self.shortcut.add_module('shortcut_conv',
+                                     nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, padding=0,
+                                               bias=False))
+            self.shortcut.add_module('shortcut_bn', nn.BatchNorm2d(out_channels))
+
+    def forward(self, x):
+        bottleneck = self.conv_reduce.forward(x)
+        bottleneck = F.relu(self.bn_reduce.forward(bottleneck), inplace=True)
+        bottleneck = self.conv_conv.forward(bottleneck)
+        bottleneck = F.relu(self.bn.forward(bottleneck), inplace=True)
+        bottleneck = self.groupdrop(bottleneck)
+        bottleneck = self.conv_expand.forward(bottleneck)
+        bottleneck = self.bn_expand.forward(bottleneck)
+        residual = self.shortcut.forward(x)
+        return F.relu(residual + bottleneck, inplace=True)
 
 class SENeXtBottleneck(nn.Module):
     """
@@ -175,10 +259,11 @@ class SelNeXtBottleneck(nn.Module):
         self.bn = nn.BatchNorm2d(D)
         self.conv_expand = nn.Conv2d(D, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn_expand = nn.BatchNorm2d(out_channels)
+        self.select = GroupAttDrop(self.cardinality * self.group_width, self.cardinality, self.group_width)
         # Select layers
-        self.fc1 = nn.Conv2d(D, D//16, kernel_size=1)  # Use nn.Conv2d instead of nn.Linear
-        self.fc2 = nn.Conv2d(D//16, cardinality, kernel_size=1)
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        #self.fc1 = nn.Conv2d(D, D//16, kernel_size=1)  # Use nn.Conv2d instead of nn.Linear
+        #self.fc2 = nn.Conv2d(D//16, cardinality, kernel_size=1)
+        #self.avg_pool = nn.AdaptiveAvgPool2d(1)
         
         self.shortcut = nn.Sequential()
         if in_channels != out_channels:
@@ -191,10 +276,11 @@ class SelNeXtBottleneck(nn.Module):
         bottleneck = self.conv_reduce.forward(x)
         bottleneck = F.relu(self.bn_reduce.forward(bottleneck), inplace=True)
         # Select groups
-        w = self.avg_pool(bottleneck)
-        w = F.relu(self.fc1(w))
-        w = F.sigmoid(self.fc2(w))
-        mask = GroupAttDrop(w,self.cardinality,self.group_width)
+        #w = self.avg_pool(bottleneck)
+        #w = F.relu(self.fc1(w))
+        #w = F.sigmoid(self.fc2(w))
+        #mask = GroupAttDrop(w,self.cardinality,self.group_width)
+        mask = self.select(bottleneck)
         # compute groups
         bottleneck = self.conv_conv.forward(bottleneck)
         bottleneck = F.relu(self.bn.forward(bottleneck), inplace=True)
@@ -231,6 +317,7 @@ class CifarResNeXt(nn.Module):
         self.output_size = 64
         self.stages = [64, 64 * self.widen_factor, 128 * self.widen_factor, 256 * self.widen_factor]
         model_map  = {'ResNext': ResNeXtBottleneck,
+              'DropNext': DropNeXtBottleneck,
               'SENext': SENeXtBottleneck,
               'SelNext': SelNeXtBottleneck}
         self.Bottleneck = model_map[model]
