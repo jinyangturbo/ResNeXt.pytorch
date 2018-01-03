@@ -13,15 +13,18 @@ arXiv preprint arXiv:1611.05431.
 __author__ = "Pau Rodríguez López, ISELAB, CVC-UAB"
 __email__ = "pau.rodri1@gmail.com"
 
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import init
 from torch.autograd import Variable
 
 def GroupAttDrop(score, cardinality, group_width):
-    assert score.size(0) == cardinality
-    mask = Variable(torch.bernoulli(score.data) - score.data) + ratio
-    wid = torch.matmul(mask.view(cardinality,1),Variable(torch.ones(1,group_width))).view(cardinality*group_width)
+    assert score.size(1) == cardinality
+    mask = Variable(torch.bernoulli(score.data) - score.data) + score
+    #wid = torch.matmul(mask.view(cardinality,1),Variable(torch.ones(1,group_width))).view(cardinality*group_width)
+    wid = torch.matmul(mask.view(-1, cardinality,1),Variable(torch.ones(mask.size(0),1,group_width)).cuda())
+    wid = wid.view(mask.size(0), cardinality*group_width, 1, 1)
     return wid
 
 def GroupRandDrop(p,  cardinality, group_width):
@@ -32,8 +35,15 @@ def GroupRandDrop(p,  cardinality, group_width):
     return wid
 
 def GroupAttAvg(score, cardinality, group_width):
-    assert score.size(0) == cardinality
-    wid = torch.matmul(score.view(cardinality,1),Variable(torch.ones(1,group_width))).view(cardinality*group_width)
+    #print(score.size())
+    #print(cardinality)
+    #wait = input("PRESS ENTER TO CONTINUE.")
+    assert score.size(1) == cardinality
+    wid = torch.matmul(score.view(-1, cardinality,1),Variable(torch.ones(score.size(0),1,group_width)).cuda())
+    #print(wid.size())
+    wid = wid.view(score.size(0), cardinality*group_width, 1, 1)
+    #print(wid.size())
+    #print(score.size())
     return wid
 
 class ResNeXtBottleneck(nn.Module):
@@ -96,11 +106,11 @@ class SENeXtBottleneck(nn.Module):
             base_width: base number of channels in each group.
             widen_factor: factor to reduce the input dimensionality before convolution.
         """
-        super(ResNeXtBottleneck, self).__init__()
+        super(SENeXtBottleneck, self).__init__()
         width_ratio = out_channels / (widen_factor * 64.)
         self.cardinality = cardinality
         self.group_width = int(base_width * width_ratio)
-        D = cardinality * group_width
+        D = self.cardinality * self.group_width
         self.conv_reduce = nn.Conv2d(in_channels, D, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn_reduce = nn.BatchNorm2d(D)
         self.conv_conv = nn.Conv2d(D, D, kernel_size=3, stride=stride, padding=1, groups=cardinality, bias=False)
@@ -109,8 +119,8 @@ class SENeXtBottleneck(nn.Module):
         self.bn_expand = nn.BatchNorm2d(out_channels)
         # Select layers
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc1 = nn.Conv2d(out_channels, out_channels//16, kernel_size=1)  # Use nn.Conv2d instead of nn.Linear
-        self.fc2 = nn.Conv2d(out_channels//16, out_channels, kernel_size=1)
+        self.fc1 = nn.Conv2d(D, D//16, kernel_size=1)  # Use nn.Conv2d instead of nn.Linear
+        self.fc2 = nn.Conv2d(D//16, cardinality, kernel_size=1)
         self.shortcut = nn.Sequential()
         if in_channels != out_channels:
             self.shortcut.add_module('shortcut_conv',
@@ -128,7 +138,11 @@ class SENeXtBottleneck(nn.Module):
         w = F.relu(self.fc1(w))
         w = F.sigmoid(self.fc2(w))
         # Expand
-        bottleneck = bottleneck * GroupAttAvg(w,self.cardinality,self.group_width)
+        wid = GroupAttAvg(w,self.cardinality,self.group_width)
+        #print(wid.size())
+        #print(bottleneck.size())
+        #wait = input("PRESS ENTER TO CONTINUE.")
+        bottleneck = bottleneck * wid
         bottleneck = self.conv_expand.forward(bottleneck)
         bottleneck = self.bn_expand.forward(bottleneck)
         residual = self.shortcut.forward(x)
@@ -150,11 +164,11 @@ class SelNeXtBottleneck(nn.Module):
             base_width: base number of channels in each group.
             widen_factor: factor to reduce the input dimensionality before convolution.
         """
-        super(ResNeXtBottleneck, self).__init__()
+        super(SelNeXtBottleneck, self).__init__()
         width_ratio = out_channels / (widen_factor * 64.)
         self.cardinality = cardinality
         self.group_width = int(base_width * width_ratio)
-        D = cardinality * group_width
+        D = self.cardinality * self.group_width
         self.conv_reduce = nn.Conv2d(in_channels, D, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn_reduce = nn.BatchNorm2d(D)
         self.conv_conv = nn.Conv2d(D, D, kernel_size=3, stride=stride, padding=1, groups=cardinality, bias=False)
@@ -222,9 +236,9 @@ class CifarResNeXt(nn.Module):
         self.Bottleneck = model_map[model]
         self.conv_1_3x3 = nn.Conv2d(3, 64, 3, 1, 1, bias=False)
         self.bn_1 = nn.BatchNorm2d(64)
-        self.stage_1 = self.block('stage_1', self.Bottleneck, self.stages[0], self.stages[1], 1)
-        self.stage_2 = self.block('stage_2', self.Bottleneck, self.stages[1], self.stages[2], 2)
-        self.stage_3 = self.block('stage_3', self.Bottleneck, self.stages[2], self.stages[3], 2)
+        self.stage_1 = self.block('stage_1', self.stages[0], self.stages[1], 1)
+        self.stage_2 = self.block('stage_2', self.stages[1], self.stages[2], 2)
+        self.stage_3 = self.block('stage_3', self.stages[2], self.stages[3], 2)
         self.classifier = nn.Linear(self.stages[3], nlabels)
         init.kaiming_normal(self.classifier.weight)
 
@@ -237,7 +251,7 @@ class CifarResNeXt(nn.Module):
             elif key.split('.')[-1] == 'bias':
                 self.state_dict()[key][...] = 0
 
-    def block(self, Bottleneck, name, in_channels, out_channels, pool_stride=2):
+    def block(self, name, in_channels, out_channels, pool_stride=2):
         """ Stack n bottleneck modules where n is inferred from the depth of the network.
 
         Args:

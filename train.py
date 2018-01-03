@@ -45,8 +45,8 @@ if __name__ == '__main__':
     parser.add_argument('--test', '-t', action='store_true', help='Test only flag.')
     # Architecture
     parser.add_argument('--depth', type=int, default=29, help='Model depth.')
-    parser.add_argument('--cardinality', type=int, default=8, help='Model cardinality (group).')
-    parser.add_argument('--base_width', type=int, default=64, help='Number of channels in each group.')
+    parser.add_argument('--cardinality', type=int, default=32, help='Model cardinality (group).')
+    parser.add_argument('--base_width', type=int, default=16, help='Number of channels in each group.')
     parser.add_argument('--widen_factor', type=int, default=4, help='Widen factor. 4 -> 64, 8 -> 128, ...')
     # Acceleration
     parser.add_argument('--ngpu', type=int, default=1, help='0 = CPU.')
