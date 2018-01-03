@@ -24,7 +24,7 @@ def GroupAttDrop(score, cardinality, group_width):
     wid = torch.matmul(mask.view(cardinality,1),Variable(torch.ones(1,group_width))).view(cardinality*group_width)
     return wid
 
-def GroupRandDrop(p = 0.5,  cardinality, group_width):
+def GroupRandDrop(p,  cardinality, group_width):
     assert p < 1.
     mask = torch.FloatTensor(1).fill_(1-p).expand(cardinality)
     mask = torch.bernoulli(mask)
@@ -197,7 +197,7 @@ class CifarResNeXt(nn.Module):
     https://arxiv.org/pdf/1611.05431.pdf
     """
 
-    def __init__(self, cardinality, depth, nlabels, base_width, widen_factor=4):
+    def __init__(self, model, cardinality, depth, nlabels, base_width, widen_factor=4):
         """ Constructor
 
         Args:
@@ -216,12 +216,15 @@ class CifarResNeXt(nn.Module):
         self.nlabels = nlabels
         self.output_size = 64
         self.stages = [64, 64 * self.widen_factor, 128 * self.widen_factor, 256 * self.widen_factor]
-
+        model_map  = {'ResNext': ResNeXtBottleneck,
+              'SENext': SENeXtBottleneck,
+              'SelNext': SelNeXtBottleneck}
+        self.Bottleneck = model_map[model]
         self.conv_1_3x3 = nn.Conv2d(3, 64, 3, 1, 1, bias=False)
         self.bn_1 = nn.BatchNorm2d(64)
-        self.stage_1 = self.block('stage_1', self.stages[0], self.stages[1], 1)
-        self.stage_2 = self.block('stage_2', self.stages[1], self.stages[2], 2)
-        self.stage_3 = self.block('stage_3', self.stages[2], self.stages[3], 2)
+        self.stage_1 = self.block('stage_1', self.Bottleneck, self.stages[0], self.stages[1], 1)
+        self.stage_2 = self.block('stage_2', self.Bottleneck, self.stages[1], self.stages[2], 2)
+        self.stage_3 = self.block('stage_3', self.Bottleneck, self.stages[2], self.stages[3], 2)
         self.classifier = nn.Linear(self.stages[3], nlabels)
         init.kaiming_normal(self.classifier.weight)
 
@@ -234,7 +237,7 @@ class CifarResNeXt(nn.Module):
             elif key.split('.')[-1] == 'bias':
                 self.state_dict()[key][...] = 0
 
-    def block(self, name, in_channels, out_channels, pool_stride=2):
+    def block(self, Bottleneck, name, in_channels, out_channels, pool_stride=2):
         """ Stack n bottleneck modules where n is inferred from the depth of the network.
 
         Args:
@@ -250,11 +253,11 @@ class CifarResNeXt(nn.Module):
         for bottleneck in range(self.block_depth):
             name_ = '%s_bottleneck_%d' % (name, bottleneck)
             if bottleneck == 0:
-                block.add_module(name_, ResNeXtBottleneck(in_channels, out_channels, pool_stride, self.cardinality,
+                block.add_module(name_, self.Bottleneck(in_channels, out_channels, pool_stride, self.cardinality,
                                                           self.base_width, self.widen_factor))
             else:
                 block.add_module(name_,
-                                 ResNeXtBottleneck(out_channels, out_channels, 1, self.cardinality, self.base_width,
+                                 self.Bottleneck(out_channels, out_channels, 1, self.cardinality, self.base_width,
                                                    self.widen_factor))
         return block
 

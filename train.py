@@ -32,7 +32,8 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', '-e', type=int, default=300, help='Number of epochs to train.')
     parser.add_argument('--batch_size', '-b', type=int, default=128, help='Batch size.')
     parser.add_argument('--learning_rate', '-lr', type=float, default=0.1, help='The Learning Rate.')
-    parser.add_argument('--momentum', '-m', type=float, default=0.9, help='Momentum.')
+    parser.add_argument('--momentum', type=float, default=0.9, help='Momentum.')
+    parser.add_argument('--model', '-m', type=str, default="ResNext", help='Model.')
     parser.add_argument('--decay', '-d', type=float, default=0.0005, help='Weight decay (L2 penalty).')
     parser.add_argument('--test_bs', type=int, default=10)
     parser.add_argument('--schedule', type=int, nargs='+', default=[150, 225],
@@ -95,7 +96,7 @@ if __name__ == '__main__':
         os.makedirs(args.save)
 
     # Init model, criterion, and optimizer
-    net = CifarResNeXt(args.cardinality, args.depth, nlabels, args.base_width, args.widen_factor)
+    net = CifarResNeXt(args.model, args.cardinality, args.depth, nlabels, args.base_width, args.widen_factor)
     print(net)
     if args.ngpu > 1:
         net = torch.nn.DataParallel(net, device_ids=list(range(args.ngpu)))
