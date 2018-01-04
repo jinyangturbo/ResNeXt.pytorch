@@ -124,7 +124,8 @@ if __name__ == '__main__':
             optimizer.step()
 
             # exponential moving average
-            loss_avg = loss_avg * 0.2 + loss.data[0] * 0.8
+            loss_avg = loss_avg * 0.98 + loss.data[0] * 0.02
+            if batch_idx % 100 == 0 or batch_idx < 100: print(batch_idx,loss_avg)
         state['train_loss'] = loss_avg
 
 

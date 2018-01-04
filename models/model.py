@@ -19,9 +19,49 @@ import torch.nn.functional as F
 from torch.nn import init
 from torch.autograd import Variable
 
-import torch
-import torch.nn as nn
-from torch.autograd import Variable
+class DropCombine(nn.Module):
+    def __init__(self, channels, res_drop = 0., p = 0.):
+        super(DropCombine, self).__init__()
+        self.p = p
+        self.res_drop = res_drop
+        self.channels = channels
+        self.fix_prob = torch.FloatTensor(1).fill_(1-self.res_drop).expand((self.channels)).cuda()
+        self.fix_mask = torch.bernoulli(self.fix_prob).cuda()
+        self.one_mask = torch.FloatTensor(1).fill_(1).expand(self.channels).cuda()
+        self.x_prob = torch.FloatTensor(1).fill_(1-self.p).expand((self.channels)).cuda()
+        # print(self.p)
+
+    def forward(self, res, x):
+        view_size = [1, self.channels] + [1] * (len(x.size()) - 2)
+        if self.training==True:
+            # compute the residual of dropout
+            if self.p > 0.:
+                self.x_mask = torch.bernoulli(self.x_prob) / (1. - self.p) - self.one_mask
+                self.x_op = Variable(self.x_mask.view(view_size).expand_as(x)).cuda()
+                #self.x_op = Variable(self.x_mask.view(view_size)).cuda()
+                res = res + x * self.x_op
+        if self.res_drop > 0.:
+            self.fix_op = Variable(self.fix_mask.view(view_size).expand_as(x)).cuda()
+            res = res * self.fix_op 
+        return res + x
+
+class SFDropoutLayer(nn.Module):
+    def __init__(self, in_planes, p):
+        super(SFDropoutLayer, self).__init__()
+        assert p < 1.
+        self.p = p
+        self.in_planes = in_planes
+        self.prob_tensor = torch.FloatTensor(1).fill_(1-self.p).expand((self.in_planes)).cuda()
+        # print(self.p)
+
+    def forward(self, x):
+        if self.training==False: return x
+        # batch shared dropout mask
+        self.mask = torch.bernoulli(self.prob_tensor)
+        view_size = [1, self.in_planes] + [1] * (len(x.size()) - 2)
+        self.input_mask = Variable((self.mask / (1. - self.p)).view(view_size).expand_as(x)).cuda()
+        return x*self.input_mask
+
 
 class GroupAttDrop(nn.Module):
     def __init__(self, in_planes, cardinality, group_width, is_drop = True):
@@ -83,13 +123,25 @@ class ExpandConv(nn.Module):
         self.wid = torch.matmul(x.view(-1, self.cardinality,1),self.one_tensor.expand(x.size(0),-1,-1))
         self.wid = self.wid.view(-1, self.D, 1, 1)
         return self.wid
+    
 
+
+class DropCombineBottleneck(nn.Module):
+
+    def __init__(self, in_channels, out_channels, stride, cardinality, base_width, widen_factor, res_drop = 0., p = 0.):
+        super(DropCombineBottleneck, self).__init__()
+        self.layer = ResNeXtBottleneck(in_channels, out_channels, stride, cardinality, base_width, widen_factor, res_drop = 0.05, p = 0.2)
+
+    def forward(self, x):
+        return self.layer(x)   
+    
+    
 class ResNeXtBottleneck(nn.Module):
     """
     RexNeXt bottleneck type C (https://github.com/facebookresearch/ResNeXt/blob/master/models/resnext.lua)
     """
 
-    def __init__(self, in_channels, out_channels, stride, cardinality, base_width, widen_factor):
+    def __init__(self, in_channels, out_channels, stride, cardinality, base_width, widen_factor, res_drop = 0., p = 0.):
         """ Constructor
 
         Args:
@@ -109,23 +161,28 @@ class ResNeXtBottleneck(nn.Module):
         self.bn = nn.BatchNorm2d(D)
         self.conv_expand = nn.Conv2d(D, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn_expand = nn.BatchNorm2d(out_channels)
-
         self.shortcut = nn.Sequential()
         if in_channels != out_channels:
             self.shortcut.add_module('shortcut_conv',
                                      nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, padding=0,
                                                bias=False))
             self.shortcut.add_module('shortcut_bn', nn.BatchNorm2d(out_channels))
+        self.combine = DropCombine(out_channels, res_drop, p)
+        self.sfdrop = SFDropoutLayer(out_channels, p)
+        self.channeldrop = nn.Dropout2d(p)
 
     def forward(self, x):
-        bottleneck = self.conv_reduce.forward(x)
+        bottleneck = self.conv_reduce.forward(F.relu(x))
         bottleneck = F.relu(self.bn_reduce.forward(bottleneck), inplace=True)
         bottleneck = self.conv_conv.forward(bottleneck)
         bottleneck = F.relu(self.bn.forward(bottleneck), inplace=True)
         bottleneck = self.conv_expand.forward(bottleneck)
         bottleneck = self.bn_expand.forward(bottleneck)
         residual = self.shortcut.forward(x)
-        return F.relu(residual + bottleneck, inplace=True)
+        return self.combine(residual, bottleneck)
+        #return residual+self.sfdrop(bottleneck)
+        #return residual + self.channeldrop(bottleneck)
+        #return residual+bottleneck
 
     
 class DropNeXtBottleneck(nn.Module):
@@ -319,6 +376,7 @@ class CifarResNeXt(nn.Module):
         model_map  = {'ResNext': ResNeXtBottleneck,
               'DropNext': DropNeXtBottleneck,
               'SENext': SENeXtBottleneck,
+              'DropCombine' : DropCombineBottleneck,
               'SelNext': SelNeXtBottleneck}
         self.Bottleneck = model_map[model]
         self.conv_1_3x3 = nn.Conv2d(3, 64, 3, 1, 1, bias=False)
