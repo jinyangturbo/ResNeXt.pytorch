@@ -19,31 +19,64 @@ import torch.nn.functional as F
 from torch.nn import init
 from torch.autograd import Variable
 
+#import InplaceMul
+'''
+from torch.autograd.function import InplaceFunction
+
+class InplaceMul(InplaceFunction):
+    @staticmethod
+    def forward(cls, ctx, input, multiplier):
+        ctx.mark_dirty(input)
+        ctx.multiplier = multiplier
+        output = input
+        view_size = [1, input.size(1)] + [1] * (len(input.size()) - 2)
+        output.mul_(ctx.multiplier.view(view_size).expand_as(output))
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        view_size = [1, grad_output.size(1)] + [1] * (len(grad_output.size()) - 2)
+        return grad_output.mul_(ctx.multiplier.view(view_size).expand_as(grad_output))
+'''
+
 class DropCombine(nn.Module):
     def __init__(self, channels, res_drop = 0., p = 0.):
         super(DropCombine, self).__init__()
         self.p = p
         self.res_drop = res_drop
         self.channels = channels
-        self.fix_prob = torch.FloatTensor(1).fill_(1-self.res_drop).expand((self.channels)).cuda()
+        self.fix_prob = torch.FloatTensor(1, self.channels).fill_(1-self.res_drop).cuda()
         self.fix_mask = torch.bernoulli(self.fix_prob).cuda()
-        self.one_mask = torch.FloatTensor(1).fill_(1).expand(self.channels).cuda()
-        self.x_prob = torch.FloatTensor(1).fill_(1-self.p).expand((self.channels)).cuda()
+        self.one_mask = torch.FloatTensor(1, self.channels).fill_(1).cuda()
+        self.x_prob = torch.FloatTensor(1, self.channels).fill_(1-self.p).cuda()
+        self.x_mask = torch.FloatTensor(1, self.channels).fill_(0).cuda()
         # print(self.p)
 
     def forward(self, res, x):
         view_size = [1, self.channels] + [1] * (len(x.size()) - 2)
+        """
         if self.training==True:
             # compute the residual of dropout
             if self.p > 0.:
                 self.x_mask = torch.bernoulli(self.x_prob) / (1. - self.p) - self.one_mask
                 self.x_op = Variable(self.x_mask.view(view_size).expand_as(x)).cuda()
-                #self.x_op = Variable(self.x_mask.view(view_size)).cuda()
+                
                 res = res + x * self.x_op
         if self.res_drop > 0.:
             self.fix_op = Variable(self.fix_mask.view(view_size).expand_as(x)).cuda()
             res = res * self.fix_op 
-        return res + x
+        """
+        self.fix_op = Variable(self.fix_mask.view(view_size), requires_grad=False).cuda()
+        #if self.training==False: return res * self.fix_op + x
+        self.x_mask = (torch.bernoulli(self.x_prob) / (1. - self.p) - self.one_mask) * self.fix_mask + self.one_mask
+        if self.training==False: self.x_mask = self.one_mask
+        self.x_op = Variable(self.x_mask.view(view_size), requires_grad=False).cuda()
+        return res * self.fix_op + x * self.x_op
+        '''
+        self.x_mask = (torch.bernoulli(self.x_prob) / (1. - self.p) - self.one_mask) * self.fix_mask + self.one_mask
+        #return res.data.mul_(self.fix_mask.view(view_size)) + x.data.mul_(self.x_mask.view(view_size))).cuda()
+        return InplaceMul.apply(res,self.fix_mask) + InplaceMul.apply(x,self.x_mask)
+        '''
 
 class SFDropoutLayer(nn.Module):
     def __init__(self, in_planes, p):
@@ -128,9 +161,9 @@ class ExpandConv(nn.Module):
 
 class DropCombineBottleneck(nn.Module):
 
-    def __init__(self, in_channels, out_channels, stride, cardinality, base_width, widen_factor, res_drop = 0., p = 0.):
+    def __init__(self, in_channels, out_channels, stride, cardinality, base_width, widen_factor, res_drop = 0., p = 0., preact = False):
         super(DropCombineBottleneck, self).__init__()
-        self.layer = ResNeXtBottleneck(in_channels, out_channels, stride, cardinality, base_width, widen_factor, res_drop = 0.05, p = 0.2)
+        self.layer = ResNeXtBottleneck(in_channels, out_channels, stride, cardinality, base_width, widen_factor, res_drop = 0.05, p = 0.2, preact = preact)
 
     def forward(self, x):
         return self.layer(x)   
@@ -141,7 +174,7 @@ class ResNeXtBottleneck(nn.Module):
     RexNeXt bottleneck type C (https://github.com/facebookresearch/ResNeXt/blob/master/models/resnext.lua)
     """
 
-    def __init__(self, in_channels, out_channels, stride, cardinality, base_width, widen_factor, res_drop = 0., p = 0.):
+    def __init__(self, in_channels, out_channels, stride, cardinality, base_width, widen_factor, res_drop = 0., p = 0., preact = False):
         """ Constructor
 
         Args:
@@ -153,8 +186,10 @@ class ResNeXtBottleneck(nn.Module):
             widen_factor: factor to reduce the input dimensionality before convolution.
         """
         super(ResNeXtBottleneck, self).__init__()
-        width_ratio = out_channels / (widen_factor * 64.)
-        D = cardinality * int(base_width * width_ratio)
+        #width_ratio = out_channels / (widen_factor * 64.)
+        D = cardinality * base_width
+        self.preact = preact
+        self.pre_bn = nn.BatchNorm2d(in_channels)
         self.conv_reduce = nn.Conv2d(in_channels, D, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn_reduce = nn.BatchNorm2d(D)
         self.conv_conv = nn.Conv2d(D, D, kernel_size=3, stride=stride, padding=1, groups=cardinality, bias=False)
@@ -168,21 +203,36 @@ class ResNeXtBottleneck(nn.Module):
                                                bias=False))
             self.shortcut.add_module('shortcut_bn', nn.BatchNorm2d(out_channels))
         self.combine = DropCombine(out_channels, res_drop, p)
-        self.sfdrop = SFDropoutLayer(out_channels, p)
-        self.channeldrop = nn.Dropout2d(p)
+        #self.sfdrop = SFDropoutLayer(out_channels, p)
+        #self.channeldrop = nn.Dropout2d(p)
 
     def forward(self, x):
-        bottleneck = self.conv_reduce.forward(F.relu(x))
-        bottleneck = F.relu(self.bn_reduce.forward(bottleneck), inplace=True)
-        bottleneck = self.conv_conv.forward(bottleneck)
-        bottleneck = F.relu(self.bn.forward(bottleneck), inplace=True)
-        bottleneck = self.conv_expand.forward(bottleneck)
-        bottleneck = self.bn_expand.forward(bottleneck)
-        residual = self.shortcut.forward(x)
-        return self.combine(residual, bottleneck)
-        #return residual+self.sfdrop(bottleneck)
-        #return residual + self.channeldrop(bottleneck)
-        #return residual+bottleneck
+        '''
+        #for pre-activation residual
+        bottleneck = F.relu(self.pre_bn(x))
+        bottleneck = self.conv_reduce(bottleneck)
+        bottleneck = F.relu(self.bn_reduce(bottleneck), inplace=True)
+        bottleneck = self.conv_conv(bottleneck)
+        bottleneck = F.relu(self.bn(bottleneck), inplace=True)
+        bottleneck = self.conv_expand(bottleneck)
+        #bottleneck = self.bn_expand(bottleneck)
+        #return self.combine(self.shortcut(x), bottleneck)
+        #return self.shortcut(x) + self.sfdrop(bottleneck)
+        #return self.shortcut(x) + self.channeldrop(bottleneck)
+        return self.shortcut(x) + bottleneck
+        '''
+        if self.preact == True: bottleneck = F.relu(self.pre_bn(x))
+        else: bottleneck = x
+        bottleneck = self.conv_reduce(bottleneck)
+        bottleneck = F.relu(self.bn_reduce(bottleneck), inplace=True)
+        bottleneck = self.conv_conv(bottleneck)
+        bottleneck = F.relu(self.bn(bottleneck), inplace=True)
+        bottleneck = self.conv_expand(bottleneck)
+        if self.preact == False: bottleneck = self.bn_expand(bottleneck)     
+        #out = self.shortcut(x) + bottleneck
+        out = self.combine(self.shortcut(x), bottleneck)
+        if self.preact == False: out = F.relu(out, inplace=True)
+        return out
 
     
 class DropNeXtBottleneck(nn.Module):
@@ -202,8 +252,8 @@ class DropNeXtBottleneck(nn.Module):
             widen_factor: factor to reduce the input dimensionality before convolution.
         """
         super(DropNeXtBottleneck, self).__init__()
-        width_ratio = out_channels / (widen_factor * 64.)
-        self.group_width = int(base_width * width_ratio)
+        #width_ratio = out_channels / (widen_factor * 64.)
+        self.group_width = base_width
         D = cardinality * self.group_width 
         self.conv_reduce = nn.Conv2d(in_channels, D, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn_reduce = nn.BatchNorm2d(D)
@@ -248,9 +298,9 @@ class SENeXtBottleneck(nn.Module):
             widen_factor: factor to reduce the input dimensionality before convolution.
         """
         super(SENeXtBottleneck, self).__init__()
-        width_ratio = out_channels / (widen_factor * 64.)
+        #width_ratio = out_channels / (widen_factor * 64.)
         self.cardinality = cardinality
-        self.group_width = int(base_width * width_ratio)
+        self.group_width = base_width
         D = self.cardinality * self.group_width
         self.conv_reduce = nn.Conv2d(in_channels, D, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn_reduce = nn.BatchNorm2d(D)
@@ -306,9 +356,9 @@ class SelNeXtBottleneck(nn.Module):
             widen_factor: factor to reduce the input dimensionality before convolution.
         """
         super(SelNeXtBottleneck, self).__init__()
-        width_ratio = out_channels / (widen_factor * 64.)
+        #width_ratio = out_channels / (widen_factor * 64.)
         self.cardinality = cardinality
-        self.group_width = int(base_width * width_ratio)
+        self.group_width = base_width
         D = self.cardinality * self.group_width
         self.conv_reduce = nn.Conv2d(in_channels, D, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn_reduce = nn.BatchNorm2d(D)
@@ -354,7 +404,7 @@ class CifarResNeXt(nn.Module):
     https://arxiv.org/pdf/1611.05431.pdf
     """
 
-    def __init__(self, model, cardinality, depth, nlabels, base_width, widen_factor=4):
+    def __init__(self, model, cardinality, depth, nlabels, base_width, widen_factor=4, band_width = 64, preact = False):
         """ Constructor
 
         Args:
@@ -365,14 +415,15 @@ class CifarResNeXt(nn.Module):
             widen_factor: factor to adjust the channel dimensionality
         """
         super(CifarResNeXt, self).__init__()
+        self.preact = preact
         self.cardinality = cardinality
         self.depth = depth
         self.block_depth = (self.depth - 2) // 9
         self.base_width = base_width
         self.widen_factor = widen_factor
         self.nlabels = nlabels
-        self.output_size = 64
-        self.stages = [64, 64 * self.widen_factor, 128 * self.widen_factor, 256 * self.widen_factor]
+        self.output_size = band_width
+        self.stages = [64, band_width * self.widen_factor, 2* band_width * self.widen_factor, 4 * band_width * self.widen_factor]
         model_map  = {'ResNext': ResNeXtBottleneck,
               'DropNext': DropNeXtBottleneck,
               'SENext': SENeXtBottleneck,
@@ -381,9 +432,9 @@ class CifarResNeXt(nn.Module):
         self.Bottleneck = model_map[model]
         self.conv_1_3x3 = nn.Conv2d(3, 64, 3, 1, 1, bias=False)
         self.bn_1 = nn.BatchNorm2d(64)
-        self.stage_1 = self.block('stage_1', self.stages[0], self.stages[1], 1)
-        self.stage_2 = self.block('stage_2', self.stages[1], self.stages[2], 2)
-        self.stage_3 = self.block('stage_3', self.stages[2], self.stages[3], 2)
+        self.stage_1 = self.block('stage_1', self.stages[0], self.stages[1], 1, 1)
+        self.stage_2 = self.block('stage_2', self.stages[1], self.stages[2], 2, 2)
+        self.stage_3 = self.block('stage_3', self.stages[2], self.stages[3], 4, 2)
         self.classifier = nn.Linear(self.stages[3], nlabels)
         init.kaiming_normal(self.classifier.weight)
 
@@ -396,7 +447,7 @@ class CifarResNeXt(nn.Module):
             elif key.split('.')[-1] == 'bias':
                 self.state_dict()[key][...] = 0
 
-    def block(self, name, in_channels, out_channels, pool_stride=2):
+    def block(self, name, in_channels, out_channels, width_ratio, pool_stride=2):
         """ Stack n bottleneck modules where n is inferred from the depth of the network.
 
         Args:
@@ -413,11 +464,11 @@ class CifarResNeXt(nn.Module):
             name_ = '%s_bottleneck_%d' % (name, bottleneck)
             if bottleneck == 0:
                 block.add_module(name_, self.Bottleneck(in_channels, out_channels, pool_stride, self.cardinality,
-                                                          self.base_width, self.widen_factor))
+                                                          self.base_width * width_ratio, self.widen_factor,preact = self.preact))
             else:
                 block.add_module(name_,
-                                 self.Bottleneck(out_channels, out_channels, 1, self.cardinality, self.base_width,
-                                                   self.widen_factor))
+                                 self.Bottleneck(out_channels, out_channels, 1, self.cardinality, self.base_width * width_ratio,
+                                                    self.widen_factor,preact = self.preact))
         return block
 
     def forward(self, x):
